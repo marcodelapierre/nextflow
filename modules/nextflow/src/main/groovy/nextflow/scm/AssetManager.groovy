@@ -62,6 +62,9 @@ class AssetManager {
     @PackageScope
     static File root = DEFAULT_ROOT
 
+    @PackageScope
+    static final String subdirCommits = '.nextflow/commits'
+
     static public final String REVISION_DELIM = ':'
 
     /**
@@ -80,9 +83,17 @@ class AssetManager {
     /**
      * Directory where the pipeline is cloned (i.e. downloaded)
      *
-     * Schema: $NXF_ASSETS/<org>/<repo>[:<revision>]
+     * Schema: $NXF_ASSETS/<org>/<repo>.git/.nextflow/commits/<commit>
      */
     private File localPath
+
+    /**
+     * Directory where the bare repository of the pipeline
+     * is cloned (i.e. downloaded)
+     *
+     * Schema: $NXF_ASSETS/<org>/<repo>.git
+     */
+    private File localBarePath
 
     private Git _git
 
@@ -147,6 +158,7 @@ class AssetManager {
         this.revision = revision
         this.project = resolveName(pipelineName, this.revision)
         this.localPath = checkProjectDir(project, this.revision)
+        this.localBarePath = resolveLocalBarePath(project)
         this.hub = checkHubProvider(cliOpts)
         this.provider = createHubProvider(hub)
         this.provider.setRevision(this.revision)
@@ -158,7 +170,7 @@ class AssetManager {
 
     @PackageScope
     File getLocalGitConfig() {
-        localPath ? new File(localPath,'.git/config') : null
+        localBarePath ? new File(localBarePath,'config') : null
     }
 
     @PackageScope AssetManager setProject(String name) {
@@ -206,7 +218,12 @@ class AssetManager {
             throw new IllegalArgumentException("Not a valid project name: $projectName")
         }
 
-        new File(root, project + (revision ? REVISION_DELIM + revision : ''))
+        new File(root, project + '/' + subdirCommits + '/' + (revision ? revision : 'DEFAULT_BRANCH'))
+    }
+
+    @PackageScope
+    File resolveLocalBarePath(String projectName) {
+        new File(root, project + '.git')
     }
 
     /**
@@ -216,18 +233,18 @@ class AssetManager {
     @PackageScope
     void validateProjectDir() {
 
-        if( !localPath.exists() ) {
+        if( !localBarePath.exists() ) {
             return
         }
 
         // if project dir exists it must contain the Git config file
         final configProvider = guessHubProviderFromGitConfig(true)
         if( !configProvider )
-            throw new IllegalStateException("Cannot find a provider config for repository at path: $localPath")
+            throw new IllegalStateException("Cannot find a provider config for repository at path: $localBarePath")
 
         // checks that the selected hub matches with the one defined in the git config file
         if( hub != configProvider ) {
-            throw new AbortOperationException("A project with name: `$localPath` has already been downloaded from a different provider: `$configProvider`")
+            throw new AbortOperationException("A project with name: `$localBarePath` has already been downloaded from a different provider: `$configProvider`")
         }
 
     }
@@ -405,10 +422,16 @@ class AssetManager {
             return localPath.toURI().toString()
         }
 
+        if( localBarePath.exists() ) {
+            return localBarePath.toURI().toString()
+        }
+
         provider.getCloneUrl()
     }
 
     File getLocalPath() { localPath }
+
+    File getLocalBarePath() { localBarePath }
 
     ScriptFile getScriptFile(String scriptName=null) {
 
@@ -612,7 +635,7 @@ class AssetManager {
         return list.size() ==1 ? list[0] : list
     }
 
-
+    // TODO Marco what is this one used for?
     protected Git getGit() {
         if( !_git ) {
             _git = Git.open(localPath)
@@ -629,20 +652,45 @@ class AssetManager {
         assert project
 
         /*
+         * if the bare repository of the pipeline does not exists locally pull it from the remote repo
+         */
+        if( !localBarePath.exists() ) {
+            localBarePath.parentFile.mkdirs()
+            // make sure it contains a valid repository
+            checkValidRemoteRepo()
+
+            final cloneBareURL = getGitRepositoryUrl()
+            log.debug "Pulling bare repo for $project -- Using remote clone url: ${cloneBareURL}"
+
+            // clone it
+            def bare = Git.cloneRepository()
+            if( provider.hasCredentials() )
+                bare.setCredentialsProvider( provider.getGitCredentials() )
+
+            bare
+                .setBare( true )
+                .setURI(cloneBareURL)
+                .setGitDir(localBarePath)
+                .setCloneSubmodules(manifest.recurseSubmodules)
+            if( deep )
+                bare.setDepth(deep)
+            bare.call()
+        }
+
+        /*
          * if the pipeline does not exists locally pull it from the remote repo
          */
         if( !localPath.exists() ) {
             localPath.parentFile.mkdirs()
-            // make sure it contains a valid repository
-            checkValidRemoteRepo()
 
+            // TODO Marco this has to point to barelocalrepo
             final cloneURL = getGitRepositoryUrl()
             log.debug "Pulling $project -- Using remote clone url: ${cloneURL}"
 
             // clone it
             def clone = Git.cloneRepository()
-            if( provider.hasCredentials() )
-                clone.setCredentialsProvider( provider.getGitCredentials() )
+            //if( provider.hasCredentials() )
+            //    clone.setCredentialsProvider( provider.getGitCredentials() )
 
             clone
                 .setURI(cloneURL)
@@ -681,6 +729,7 @@ class AssetManager {
              * Try to checkout it from a remote branch and return
              */
             catch ( RefNotFoundException e ) {
+                // TODO Marco check the method below
                 final ref = checkoutRemoteBranch()
                 final commitId = ref?.getObjectId()
                 return commitId
@@ -1078,7 +1127,7 @@ class AssetManager {
     }
 
     protected String getGitConfigRemoteUrl() {
-        if( !localPath ) {
+        if( !localBarePath ) {
             return null
         }
 
@@ -1117,14 +1166,14 @@ class AssetManager {
 
 
     protected String guessHubProviderFromGitConfig(boolean failFast=false) {
-        assert localPath
+        assert localBarePath
 
         // find the repository remote URL from the git project config file
         final domain = getGitConfigRemoteDomain()
         if( !domain && failFast ) {
             def message = (localGitConfig.exists()
                             ? "Can't find git repository remote host -- Check config file at path: $localGitConfig"
-                            : "Can't find git repository config file -- Repository may be corrupted: $localPath" )
+                            : "Can't find git repository config file -- Repository may be corrupted: $localBarePath" )
             throw new AbortOperationException(message)
         }
 
